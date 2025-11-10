@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 # --- Importy Bibliotek ---
 import google.generativeai as genai
 import gspread
+import time
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -533,3 +534,4 @@ if __name__ == '__main__':
             logger.error(f"Krytyczny błąd w pętli main: {e}")
             logger.error("Restartowanie za 15 sekund...")
             time.sleep(15)
+
