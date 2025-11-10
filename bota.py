@@ -13,18 +13,19 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# --- 1. Konfiguracja Logowania (Ważne do debugowania) ---
+# --- 1. Konfiguracja Logowania ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- 2. Ładowanie Kluczy API (z pliku .env) ---
+# --- 2. Ładowanie Kluczy API ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -33,13 +34,9 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     logger.critical("BŁĄD: Nie znaleziono tokenów (TELEGRAM_TOKEN lub GEMINI_API_KEY) w pliku .env")
     exit()
 
-# --- 3. NOWA KONFIGURACJA (OAuth 2.0 zamiast Service Account) ---
-# Plik pobrany z Google Cloud Console (dla "Aplikacji komputerowej")
+# --- 3. KONFIGURACJA OAuth 2.0 (dla serwera) ---
 GOOGLE_CREDENTIALS_FILE = 'credentials.json' 
-# Plik, który zostanie wygenerowany po pierwszej autoryzacji
 GOOGLE_TOKEN_FILE = 'token.json' 
-
-# Potrzebujemy uprawnień do Arkuszy i Dysku
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 
 GOOGLE_SHEET_NAME = 'Odbiory_Kolonia_Warszawska'
@@ -50,66 +47,51 @@ G_DRIVE_MAIN_FOLDER_NAME = 'Lokale'
 gc = None
 worksheet = None
 drive_service = None
-g_drive_main_folder_id = None # ID folderu 'Lokale'
+g_drive_main_folder_id = None 
 
 def get_google_creds():
-    """
-    Wersja serwerowa: Wczytuje token.json i odświeża go w razie potrzeby.
-    NIE próbuje uruchamiać serwera lokalnego.
-    """
+    """Wersja serwerowa: Wczytuje token.json i odświeża go w razie potrzeby."""
     creds = None
     
-    # Plik token.json MUSI istnieć na serwerze (wgrany jako Secret File)
     if os.path.exists(GOOGLE_TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_FILE, SCOPES)
     else:
         logger.critical(f"BŁĄD KRYTYCZNY: Brak pliku {GOOGLE_TOKEN_FILE}!")
-        logger.critical("Wgraj 'token.json' wygenerowany lokalnie jako Secret File na serwerze.")
-        exit() # Zatrzymuje bota, jeśli nie ma tokenu
+        exit() 
 
-    # Sprawdź, czy token jest ważny. Jeśli nie, spróbuj odświeżyć.
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             logger.info("Token wygasł, odświeżanie...")
             
-            # Odświeżenie tokenu w pamięci. 
-            # Działa, o ile w pliku token.json jest "refresh_token", 
-            # a plik credentials.json jest dostępny (też go wgramy).
-            creds.refresh(Request()) 
-            
-            # NIE próbujemy zapisywać nowego tokenu, 
-            # bo system plików serwera jest zwykle tylko do odczytu.
-            # Odświeżenie w pamięci wystarczy do czasu restartu serwera.
+            if not os.path.exists(GOOGLE_CREDENTIALS_FILE):
+                 logger.critical(f"BŁĄD KRYTYCZNY: Brak pliku {GOOGLE_CREDENTIALS_FILE}!")
+                 exit()
+                 
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                logger.critical(f"BŁĄD KRYTYCZNY: Nie można odświeżyć tokenu. Błąd: {e}")
+                exit()
         else:
-            # Jeśli nie ma tokenu LUB nie ma refresh_tokena (plik jest uszkodzony/stary)
-            logger.critical("BŁĄD KRYTYCZNY: Nie można odświeżyć tokenu.")
-            logger.critical("Wygeneruj 'token.json' od nowa lokalnie i wgraj go na serwer.")
+            logger.critical("BŁĄD KRYTYCZNY: Nie można odświeżyć tokenu (brak refresh_token).")
             exit()
     
     logger.info("Pomyślnie załadowano i zweryfikowano token Google (OAuth 2.0)")
     return creds
 
 try:
-    # --- 3a. Pobranie danych logowania (OAuth) ---
     creds = get_google_creds()
     logger.info("Pomyślnie uzyskano dane logowania Google (OAuth 2.0)")
 
-    # --- 3b. Konfiguracja Google Sheets (gspread) ---
-    # Używamy gspread.authorize() zamiast service_account()
     gc = gspread.authorize(creds) 
     spreadsheet = gc.open(GOOGLE_SHEET_NAME)
     worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
     logger.info(f"Pomyślnie połączono z Arkuszem Google: {GOOGLE_SHEET_NAME}")
 
-    # --- 3c. Konfiguracja Google Drive ---
-    # Budujemy usługę Drive przy użyciu tych samych danych logowania
     drive_service = build('drive', 'v3', credentials=creds)
     logger.info("Pomyślnie połączono z Google Drive")
 
-    # Krok 1: Znajdź główny folder "Lokale" na "Mój Dysk"
     logger.info(f"Szukanie folderu: '{G_DRIVE_MAIN_FOLDER_NAME}'...")
-    
-    # Szukamy folderu na 'Mój Dysk' (bo teraz działamy jako Ty)
     response_folder = drive_service.files().list(
         q=f"name='{G_DRIVE_MAIN_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=False",
         spaces='drive',
@@ -119,7 +101,6 @@ try:
     files = response_folder.get('files', [])
     if not files:
         logger.critical(f"BŁĄD KRYTYCZNY: Nie znaleziono folderu '{G_DRIVE_MAIN_FOLDER_NAME}' na Twoim 'Mój Dysk'!")
-        logger.critical(f"Upewnij się, że utworzyłeś folder '{G_DRIVE_MAIN_FOLDER_NAME}' na głównym poziomie 'Mój Dysk'.")
         exit()
     
     g_drive_main_folder_id = files[0].get('id')
@@ -127,12 +108,10 @@ try:
 
 except Exception as e:
     logger.critical(f"BŁĄD KRYTYCZNY: Nie można połączyć z Google: {e}")
-    logger.critical("Sprawdź, czy plik 'credentials.json' istnieje i czy API są włączone.")
     exit()
 
 
 # --- 4. Konfiguracja Gemini (AI) ---
-# (Bez zmian)
 genai.configure(api_key=GEMINI_API_KEY)
 generation_config = {
     "temperature": 0.2,
@@ -144,8 +123,7 @@ model = genai.GenerativeModel(
     generation_config=generation_config
 )
 
-# --- 5. Definicja Promptu dla AI ---
-# (Bez zmian)
+# --- 5. ZMIENIONY Prompt dla AI ---
 PROMPT_SYSTEMOWY = """
 Twoim zadaniem jest analiza zgłoszenia serwisowego. Przetwórz wiadomość użytkownika i wyekstrahuj DOKŁADNIE 3 informacje: numer_lokalu_budynku, rodzaj_usterki, podmiot_odpowiedzialny.
 
@@ -159,8 +137,8 @@ Zawsze odpowiadaj WYŁĄCZNIE w formacie JSON, zgodnie z tym schematem:
 Ustalenia:
 1.  numer_lokalu_budynku: (np. "15", "104B", "Budynek C, klatka 2", "Lokal 46/2")
 2.  rodzaj_usterki: (np. "cieknący kran", "brak prądu", "winda nie działa", "porysowana szyba")
-3.  podmiot_odpowiedzialny: (np. "administracja", "serwis", "konserwator", "deweloper", "domhomegroup")
-4.  Jeśli jakiejś informacji brakuje, wstaw w jej miejsce "BRAK DANYCH".
+3.  podmiot_odpowiedzialny: (np. "administracja", "serwis", "deweloper", "domhomegroup", "Janusz Pelc"). WAŻNE: Jeśli podmiot wygląda jak imię i nazwisko (np. Jan Kowalski), potraktuj to jako poprawną nazwę firmy/podmiotu, a NIE "BRAK DANYCH".
+4.  Jeśli jakiejś informacji (poza imionami i nazwiskami) brakuje, wstaw w jej miejsce "BRAK DANYCH".
 5.  Jeśli wiadomość to 'Rozpoczęcie odbioru', potraktuj to jako 'rodzaj_usterki' jeśli nie ma innej usterki.
 6.  Nigdy nie dodawaj żadnego tekstu przed ani po obiekcie JSON. Ani '```json' ani '```'.
 
@@ -168,7 +146,6 @@ Wiadomość użytkownika do analizy znajduje się poniżej.
 """
 
 # --- 6. Funkcja do Zapisu w Arkuszu ---
-# (Bez zmian)
 def zapisz_w_arkuszu(dane_json: dict, data_telegram: datetime) -> bool:
     """Zapisuje przeanalizowane dane w nowym wierszu Arkusza Google."""
     try:
@@ -186,58 +163,169 @@ def zapisz_w_arkuszu(dane_json: dict, data_telegram: datetime) -> bool:
         logger.error(f"Błąd podczas zapisu do Google Sheets: {e}")
         return False
 
-# --- FUNKCJA WYSYŁANIA NA GOOGLE DRIVE ---
-# (Usunięto 'supportsAllDrives' - niepotrzebne, gdy działamy jako właściciel)
+# --- ZMIENIONA FUNKCJA WYSYŁANIA NA GOOGLE DRIVE ---
 def upload_photo_to_drive(file_bytes, lokal_name, usterka_name, podmiot_name):
-    """Wyszukuje podfolder lokalu i wysyła do niego zdjęcie."""
+    """
+    Wyszukuje podfolder lokalu i wysyła do niego zdjęcie.
+    ZWRACA: (success, message, file_id)
+    """
     global drive_service, g_drive_main_folder_id
     
     try:
-        # Krok 1: Znajdź podfolder dla lokalu (np. "46.2")
         q_str = f"name='{lokal_name}' and mimeType='application/vnd.google-apps.folder' and '{g_drive_main_folder_id}' in parents and trashed=False"
-        
-        response = drive_service.files().list(
-            q=q_str, 
-            spaces='drive', 
-            fields='files(id, name)',
-        ).execute()
-        
+        response = drive_service.files().list(q=q_str, spaces='drive', fields='files(id, name)').execute()
         lokal_folder = response.get('files', [])
 
         if not lokal_folder:
             logger.error(f"Nie znaleziono folderu dla lokalu: {lokal_name} wewnątrz '{G_DRIVE_MAIN_FOLDER_NAME}'")
-            logger.error(f"Upewnij się, że utworzyłeś podfoldery (np. '46.2') wewnątrz folderu 'Lokale' na 'Mój Dysk'.")
-            return False, f"Nie znaleziono folderu Drive dla '{lokal_name}'"
+            return False, f"Nie znaleziono folderu Drive dla '{lokal_name}'", None
 
         lokal_folder_id = lokal_folder[0].get('id')
-        
-        # Krok 2: Przygotuj metadane i plik
         file_name = f"{usterka_name} - {podmiot_name}.jpg"
-        file_metadata = {
-            'name': file_name,
-            'parents': [lokal_folder_id] 
-        }
+        file_metadata = {'name': file_name, 'parents': [lokal_folder_id]}
         
-        # Krok 3: Wyślij plik
         file_bytes.seek(0)
         media = MediaIoBaseUpload(file_bytes, mimetype='image/jpeg', resumable=True)
         
         file = drive_service.files().create(
             body=file_metadata,
             media_body=media,
-            fields='id',
+            fields='id, name', # Prosimy o 'name' i 'id' w odpowiedzi
         ).execute()
         
-        logger.info(f"Pomyślnie wysłano plik '{file_name}' do folderu '{lokal_name}' (ID: {file.get('id')})")
-        return True, file_name
+        file_id = file.get('id')
+        file_name_created = file.get('name')
+        logger.info(f"Pomyślnie wysłano plik '{file_name_created}' do folderu '{lokal_name}' (ID: {file_id})")
+        return True, file_name_created, file_id # Zwracamy ID pliku!
     
     except Exception as e:
         logger.error(f"Błąd podczas wysyłania na Google Drive: {e}")
-        return False, str(e)
+        return False, str(e), None
+
+# --- NOWA FUNKCJA DO USUWANIA Z GOOGLE DRIVE ---
+def delete_file_from_drive(file_id: str) -> bool:
+    """Usuwa plik z Google Drive na podstawie jego ID."""
+    global drive_service
+    if not file_id:
+        logger.error("Próba usunięcia pliku, ale brak file_id.")
+        return False
+        
+    try:
+        drive_service.files().delete(fileId=file_id).execute()
+        logger.info(f"Pomyślnie usunięto plik z Drive (ID: {file_id})")
+        return True
+    except HttpError as e:
+        if e.resp.status == 404:
+            logger.warning(f"Nie można usunąć pliku (ID: {file_id}), już nie istnieje.")
+            return True # Traktujemy jako sukces, bo pliku i tak nie ma
+        logger.error(f"Błąd podczas usuwania pliku z Drive (ID: {file_id}): {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Nieznany błąd podczas usuwania pliku z Drive (ID: {file_id}): {e}")
+        return False
 
 
-# --- 7. Główny Handler (serce bota) ---
-# (Bez zmian)
+# --- NOWA FUNKCJA OBSŁUGI COFANIA ---
+async def handle_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Obsługuje logikę cofania usterki (tekstowej lub zdjęcia)."""
+    
+    replied_message = update.message.reply_to_message
+    replied_text = replied_message.text
+    chat_data = context.chat_data
+    
+    # 1. Sprawdź, czy to cofnięcie USTERKI TEKSTOWEJ
+    text_prefix = "➕ Dodano (tekst): '"
+    if replied_text.startswith(text_prefix):
+        try:
+            # Wyodrębnij treść usterki spomiędzy '...'\n(Łącznie...
+            text_suffix = "'\n(Łącznie:"
+            start = len(text_prefix)
+            end = replied_text.find(text_suffix, start)
+            if end == -1: # Na wypadek gdyby coś się zmieniło w tekście
+                raise ValueError("Nie znaleziono znacznika końca")
+                
+            usterka_to_remove = replied_text[start:end]
+            
+            if usterka_to_remove in chat_data.get('odbiur_usterki', []):
+                chat_data['odbiur_usterki'].remove(usterka_to_remove)
+                logger.info(f"Cofnięto (tekst): {usterka_to_remove}")
+                await update.message.reply_text(
+                    f"↩️ Cofnięto usterkę (tekst):\n'{usterka_to_remove}'\n\n"
+                    f"(Łącznie: {len(chat_data['odbiur_usterki'])})."
+                )
+            else:
+                logger.warning("Próbowano cofnąć tekst, którego nie ma na liście.")
+                await update.message.reply_text("❌ Nie znaleziono tej usterki na liście (może już ją cofnąłeś).")
+            return
+            
+        except Exception as e:
+            logger.error(f"Błąd parsowania tekstu do cofnięcia: {e}")
+            await update.message.reply_text("❌ Wystąpił błąd przy próbie cofnięcia tej usterki.")
+            return
+
+    # 2. Sprawdź, czy to cofnięcie ZDJĘCIA
+    photo_prefix = "✅ Zdjęcie zapisane na Drive"
+    if replied_text.startswith(photo_prefix):
+        try:
+            # A. Wyodrębnij ID pliku z ukrytego znacznika
+            hidden_marker = " \u200B" # Spacja + Znak Zerowej Szerokości
+            parts = replied_text.split(hidden_marker)
+            if len(parts) != 3:
+                raise ValueError("Brak ukrytego znacznika ID pliku w wiadomości.")
+            
+            file_id_to_delete = parts[1]
+            
+            # B. Wyodrębnij treść usterki (dla listy)
+            content_prefix = "➕ Usterka dodana do listy: '"
+            content_suffix = "'\n(Łącznie:"
+            
+            content_line_start = replied_text.find(content_prefix)
+            if content_line_start == -1:
+                 raise ValueError("Nie znaleziono linii 'Usterka dodana do listy'")
+            
+            start = content_line_start + len(content_prefix)
+            end = replied_text.find(content_suffix, start)
+            if end == -1:
+                 raise ValueError("Nie znaleziono znacznika końca usterki zdjęcia")
+
+            usterka_to_remove = replied_text[start:end] # np. "Rysa na szybie (zdjęcie)"
+
+            # C. Wykonaj akcje
+            if usterka_to_remove in chat_data.get('odbiur_usterki', []):
+                # Usuń z listy
+                chat_data['odbiur_usterki'].remove(usterka_to_remove)
+                logger.info(f"Cofnięto (z listy): {usterka_to_remove}")
+                
+                # Usuń z Drive
+                if delete_file_from_drive(file_id_to_delete):
+                    await update.message.reply_text(
+                        f"↩️ Cofnięto usterkę (tekst ORAZ zdjęcie z Drive):\n'{usterka_to_remove}'\n\n"
+                        f"(Łącznie: {len(chat_data['odbiur_usterki'])})."
+                    )
+                else:
+                    logger.error(f"Krytyczny błąd: Usunięto '{usterka_to_remove}' z listy, ale NIE udało się usunąć pliku {file_id_to_delete} z Drive.")
+                    await update.message.reply_text(
+                        f"❌ BŁĄD KRYTYCZNY:\nUsunięto wpis z listy, ale NIE udało się usunąć pliku z Google Drive.\n"
+                        f"Zgłoś to administratorowi (ID pliku: {file_id_to_delete})."
+                    )
+            else:
+                logger.warning("Próbowano cofnąć zdjęcie, którego nie ma na liście.")
+                await update.message.reply_text("❌ Nie znaleziono tej usterki na liście (może już ją cofnąłeś).")
+            return
+
+        except Exception as e:
+            logger.error(f"Błąd parsowania zdjęcia do cofnięcia: {e}")
+            await update.message.reply_text("❌ Wystąpił błąd przy próbie cofnięcia tego zdjęcia.")
+            return
+
+    # 3. Jeśli odpowiedziano na inną wiadomość
+    await update.message.reply_text(
+        "Nie można cofnąć tej wiadomości. \n"
+        "Aby cofnąć, odpowiedz 'cofnij' bezpośrednio na wiadomość bota (tę z zielonym '✅' lub '➕')."
+    )
+
+
+# --- 7. ZMIENIONY Główny Handler (z logiką cofania) ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Przechwytuje wiadomość, sprawdza stan sesji i decyduje co robić."""
     
@@ -256,6 +344,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message_time = update.message.date
     chat_data = context.chat_data 
+
+    # --- NOWA LOGIKA: SPRAWDŹ CZY TO POLECENIE COFNIĘCIA ---
+    if user_message.lower().strip() == 'cofnij' and update.message.reply_to_message:
+        if chat_data.get('odbiur_aktywny'):
+            logger.info("Wykryto polecenie 'cofnij' w aktywnej sesji.")
+            await handle_undo(update, context) # Przekaż do nowej funkcji
+            return # Zakończ przetwarzanie tej wiadomości
+        else:
+            await update.message.reply_text("Żaden odbiór nie jest aktywny. Nie można nic cofnąć.")
+            return
+    # --- KONIEC LOGIKI COFANIA ---
 
     try:
         # --- LOGIKA SESJI ODBIORU ---
@@ -301,9 +400,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             podmiot = dane_startowe.get('podmiot_odpowiedzialny')
 
             if lokal == "BRAK DANYCH" or podmiot == "BRAK DANYCH":
-                 await update.message.reply_text("❌ Nie udało się rozpoznać lokalu lub firmy.\nSpróbuj ponownie, np: 'Rozpoczęcie odbioru, lokal 46/2, firma domhomegroup'.")
+                 await update.message.reply_text(f"❌ Nie udało się rozpoznać lokalu lub firmy (Lokal: {lokal}, Firma: {podmiot}).\nSpróbuj ponownie, np: 'Rozpoczęcie odbioru, lokal 46/2, firma Janusz Pelc'.")
             else:
-                # Normalizujemy nazwę lokalu, np. "Lokal 46/2" -> "46.2"
                 lokal_normalized = lokal.lower().replace("lokal", "").strip().replace("/", ".")
                 
                 chat_data['odbiur_aktywny'] = True
@@ -328,11 +426,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
             chat_data['odbiur_usterki'].append(usterka_opis)
             
-            await update.message.reply_text(f"➕ Dodano (tekst): '{usterka_opis}'\n(Łącznie: {len(chat_data['odbiur_usterki'])}). Wpisz kolejną lub 'Koniec odbioru'.")
-            return 
+            # Ważne: Zapisujemy wiadomość, którą wysyłamy, aby móc na nią odpowiedzieć
+            await update.message.reply_text(
+                f"➕ Dodano (tekst): '{usterka_opis}'\n"
+                f"(Łącznie: {len(chat_data['odbiur_usterki'])}). Wpisz kolejną lub 'Koniec odbioru'."
+            )
+            return
+            
+        # SCENARIUSZ 4: Wiadomość poza sesją
+        else:
+            logger.warning(f"Otrzymano wiadomość '{user_message}', gdy sesja nie jest aktywna. Ignorowanie.")
+            await update.message.reply_text(
+                "Żaden odbiór nie jest aktywny. \n"
+                "Aby rozpocząć, napisz: 'Rozpoczęcie odbioru, [lokal], [firma]'.")
+            return
 
     except json.JSONDecodeError as json_err:
-        logger.error(f"Błąd parsowania JSON od Gemini (w logice sesji): {json_err}. Odpowiedź AI: {response.text}")
+        cleaned_text = locals().get('cleaned_text', 'BRAK DANYCH')
+        logger.error(f"Błąd parsowania JSON od Gemini (w logice sesji): {json_err}. Odpowiedź AI: {cleaned_text}")
         await update.message.reply_text("❌ Błąd analizy AI. Spróbuj sformułować wiadomość inaczej.")
         return
     except Exception as session_err:
@@ -340,45 +451,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Wystąpił krytyczny błąd: {session_err}")
         return
 
-    # --- LOGIKA DOMYŚLNA (FALLBACK) ---
-    # (Bez zmian)
-    
-    logger.info(f"Brak aktywnego odbioru. Przetwarzanie jako pojedyncze zgłoszenie: '{user_message}'")
-    
-    try:
-        await update.message.reply_text("Przetwarzam jako pojedyncze zgłoszenie... 🧠")
-        
-        logger.info("Wysyłanie do Gemini...")
-        response = model.generate_content([PROMPT_SYSTEMOWY, user_message])
-        
-        cleaned_text = response.text.strip().replace("```json", "").replace("```", "").strip()
-        dane = json.loads(cleaned_text)
-        logger.info(f"Gemini zwróciło JSON: {dane}")
 
-        if zapisz_w_arkuszu(dane, message_time):
-            await update.message.reply_text(f"✅ Zgłoszenie (pojedyncze) przyjęte i zapisane:\n\n"
-                                          f"Lokal: {dane.get('numer_lokalu_budynku')}\n"
-                                          f"Usterka: {dane.get('rodzaj_usterki')}\n"
-                                          f"Podmiot: {dane.get('podmiot_odpowiedzialny')}")
-        else:
-            await update.message.reply_text("❌ Błąd zapisu do bazy danych (Arkusza). Skontaktuj się z adminem.")
-
-    except json.JSONDecodeError:
-        logger.error(f"Błąd parsowania JSON od Gemini (fallback). Odpowiedź AI: {response.text}")
-        await update.message.reply_text("❌ Błąd analizy AI (fallback). Spróbuj sformułować zgłoszenie inaczej.")
-    except Exception as e:
-        logger.error(f"Wystąpił nieoczekiwany błąd (fallback): {e}")
-        await update.message.reply_text(f"❌ Wystąpił krytyczny błąd (fallback): {e}")
-
-
-# --- 7b. NOWY HANDLER DLA ZDJĘĆ ---
-# (Bez zmian)
+# --- 7b. ZMIENIONY Handler Zdjęć (dodaje ukryte ID) ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Przechwytuje zdjęcie W TRAKCIE aktywnej sesji odbioru."""
     chat_data = context.chat_data
     
     if not chat_data.get('odbiur_aktywny'):
-        await update.message.reply_text("Wyślij zdjęcie *po* rozpoczęciu odbioru. Teraz ta fotka zostanie zignorowana.")
+        await update.message.reply_text("Wyślij zdjęcie *tylko po* rozpoczęciu odbioru. Teraz ta fotka zostanie zignorowana.")
         return
 
     usterka = update.message.caption
@@ -393,18 +473,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         photo_file = await update.message.photo[-1].get_file()
-        
         file_bytes_io = io.BytesIO()
         await photo_file.download_to_memory(file_bytes_io)
         
-        success, message = upload_photo_to_drive(file_bytes_io, lokal, usterka, podmiot)
+        # Odbieramy teraz 3 wartości, w tym ID pliku!
+        success, message, file_id = upload_photo_to_drive(file_bytes_io, lokal, usterka, podmiot)
         
         if success:
-            chat_data['odbiur_usterki'].append(f"{usterka} (zdjęcie)")
+            usterka_z_dopiskiem = f"{usterka} (zdjęcie)"
+            chat_data['odbiur_usterki'].append(usterka_z_dopiskiem)
             
-            await update.message.reply_text(f"✅ Zdjęcie zapisane na Drive jako: '{message}'\n"
-                                          f"➕ Usterka dodana do listy: '{usterka} (zdjęcie)'\n"
-                                          f"(Łącznie: {len(chat_data['odbiur_usterki'])}).")
+            # --- NOWA WIADOMOŚĆ Z UKRYTYM ZNACZNIKIEM ---
+            hidden_marker = " \u200B" # Spacja + Znak Zerowej Szerokości
+            
+            reply_text = (
+                f"✅ Zdjęcie zapisane na Drive jako: '{message}'\n"
+                f"➕ Usterka dodana do listy: '{usterka_z_dopiskiem}'\n"
+                f"(Łącznie: {len(chat_data['odbiur_usterki'])})."
+                f"{hidden_marker}{file_id}{hidden_marker}" # Ukryte ID pliku na końcu
+            )
+            
+            await update.message.reply_text(reply_text)
+            # --- KONIEC NOWEJ WIADOMOŚCI ---
+            
         else:
             await update.message.reply_text(f"❌ Błąd Google Drive: {message}")
             
@@ -414,7 +505,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- 8. Uruchomienie Bota ---
-# (Bez zmian)
 def main():
     """Główna funkcja uruchamiająca bota."""
     
