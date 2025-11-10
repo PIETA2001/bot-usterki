@@ -504,7 +504,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Wystąpił błąd przy pobieraniu zdjęcia: {e}")
 
 
-# --- 8. Uruchomienie Bota ---
+# --- 8. Uruchomienie Bota (z pętlą auto-restartu) ---
 def main():
     """Główna funkcja uruchamiająca bota."""
     
@@ -516,7 +516,20 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     logger.info("Bot nasłuchuje...")
+    # Ta funkcja jest blokująca - bot działa, dopóki nie dostanie sygnału stop
     application.run_polling()
+    # Gdy run_polling() się zakończy (np. przez SIGTERM), pętla go zrestartuje
+    
 
 if __name__ == '__main__':
-    main()
+    # Ta pętla sprawia, że bot jest "nieśmiertelny"
+    # Jeśli bot się zatrzyma (np. przez restart Render), pętla uruchomi go od nowa.
+    while True:
+        try:
+            main()
+            logger.info("Bot zatrzymany. Restartowanie za 5 sekund...")
+            time.sleep(5) # Krótka pauza, aby uniknąć "gorącej pętli"
+        except Exception as e:
+            logger.error(f"Krytyczny błąd w pętli main: {e}")
+            logger.error("Restartowanie za 15 sekund...")
+            time.sleep(15)
