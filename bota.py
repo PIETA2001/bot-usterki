@@ -520,19 +520,20 @@ async def main():
     
     if not WEBHOOK_URL:
         logger.critical("BŁĄD: Zmienna środowiskowa 'WEBHOOK_URL' nie jest ustawiona!")
-        return
+        logger.critical("Ustaw ją w panelu Cloud Run na publiczny URL tej usługi.")
+        return # Zakończ, jeśli nie ma URL-a
 
     logger.info("Uruchamianie bota w trybie Webhook...")
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Dodaj handlery
+    # Dodaj handlery (bez zmian)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     # Użyj context managera. On automatycznie obsłuży
     # application.initialize() i application.shutdown()
-    # To powinno poprawnie obsłużyć sygnały zamknięcia (np. z Render)
+    # To poprawnie obsłuży sygnały zamknięcia (np. z Cloud Run)
     async with application:
         try:
             await application.bot.set_webhook(
@@ -549,17 +550,17 @@ async def main():
         await application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            secret_token=TELEGRAM_TOKEN,
+            secret_token=TELEGRAM_TOKEN, # Dodatkowe zabezpieczenie
             webhook_url=WEBHOOK_URL
         )
         # Pętla będzie tu czekać na zawsze, aż dostanie sygnał stop
 
 
 if __name__ == '__main__':
-    # Ten blok jest teraz super prosty i poprawny.
-    # asyncio.run() uruchomi main() i poprawnie obsłuży
-    # zamknięcie pętli, gdy main() się zakończy (co jest
-    # obsługiwane przez context manager 'async with application')
+    # Uruchom główną funkcję asynchroniczną.
+    # Jeśli bot się zawiesi, skrypt się zakończy.
+    # Cloud Run automatycznie wykryje ten błąd i zrestartuje cały kontener.
+    # To jest stabilny i poprawny wzorzec.
     try:
         asyncio.run(main())
     except RuntimeError as e:
