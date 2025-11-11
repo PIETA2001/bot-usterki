@@ -2,7 +2,6 @@ import os
 import json
 import logging
 import io
-import time  # <--- DODAJ TO
 import asyncio # <--- DODAJ TO
 from datetime import datetime
 from dotenv import load_dotenv
@@ -550,13 +549,9 @@ async def main():
     )
 
 if __name__ == '__main__':
-    # Ta pętla zapewnia, że bot zawsze się zrestartuje, jeśli coś pójdzie nie tak
-    while True:
-        try:
-            asyncio.run(main())
-            logger.info("Aplikacja Webhook zatrzymana. Restartowanie za 5 sekund...")
-            time.sleep(5)
-        except Exception as e:
-            logger.error(f"Krytyczny błąd w pętli asyncio main: {e}")
-            logger.error("Restartowanie za 15 sekund...")
-            time.sleep(15)
+    # Uruchom główną funkcję asynchroniczną.
+    # Jeśli bot się zawiesi, skrypt się zakończy.
+    # Render (lub Cloud Run) automatycznie wykryje ten błąd i zrestartuje cały kontener.
+    # To jest stabilny i poprawny wzorzec.
+    asyncio.run(main())
+
