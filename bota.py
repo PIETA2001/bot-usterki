@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import io
+import time  # <--- DODAJ TO
+import asyncio # <--- DODAJ TO
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -505,33 +507,56 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Wystąpił błąd przy pobieraniu zdjęcia: {e}")
 
 
-# --- 8. Uruchomienie Bota (z pętlą auto-restartu) ---
-def main():
-    """Główna funkcja uruchamiająca bota."""
+# --- 8. Uruchomienie Bota (w trybie WEBHOOK) ---
+
+# Ustawienia dla Webhooka
+# Render automatycznie poda port w zmiennej środowiskowej
+PORT = int(os.getenv('PORT', 8443)) 
+# To jest Twój publiczny adres URL z Render
+WEBHOOK_URL = "https://bot-usterki.onrender.com"
+
+async def main():
+    """Główna funkcja uruchamiająca bota w trybie Webhook."""
     
-    logger.info("Uruchamianie bota...")
+    logger.info("Uruchamianie bota w trybie Webhook...")
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Dodaj handlery (bez zmian)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    logger.info("Bot nasłuchuje...")
-    # Ta funkcja jest blokująca - bot działa, dopóki nie dostanie sygnału stop
-    application.run_polling()
-    # Gdy run_polling() się zakończy (np. przez SIGTERM), pętla go zrestartuje
+    # Krok 1: Ustaw webhooka na serwerach Telegrama
+    # Bot musi wiedzieć, gdzie wysyłać aktualizacje
+    try:
+        logger.info(f"Ustawianie webhooka na adres: {WEBHOOK_URL}")
+        await application.bot.set_webhook(
+            url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
+            allowed_updates=Update.ALL_TYPES
+        )
+    except Exception as e:
+        logger.error(f"BŁĄD KRYTYCZNY: Nie można ustawić webhooka: {e}")
+        return # Nie uruchamiaj bota, jeśli webhook się nie ustawił
+
+    # Krok 2: Uruchom serwer webhooka
+    # Bot będzie teraz nasłuchiwał na porcie podanym przez Render
+    logger.info(f"Bot nasłuchuje na porcie {PORT} pod adresem 0.0.0.0")
     
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        secret_token=TELEGRAM_TOKEN, # Dodatkowe zabezpieczenie
+        webhook_url=WEBHOOK_URL
+    )
 
 if __name__ == '__main__':
-    # Ta pętla sprawia, że bot jest "nieśmiertelny"
-    # Jeśli bot się zatrzyma (np. przez restart Render), pętla uruchomi go od nowa.
+    # Ta pętla zapewnia, że bot zawsze się zrestartuje, jeśli coś pójdzie nie tak
     while True:
         try:
-            main()
-            logger.info("Bot zatrzymany. Restartowanie za 5 sekund...")
-            time.sleep(5) # Krótka pauza, aby uniknąć "gorącej pętli"
+            asyncio.run(main())
+            logger.info("Aplikacja Webhook zatrzymana. Restartowanie za 5 sekund...")
+            time.sleep(5)
         except Exception as e:
-            logger.error(f"Krytyczny błąd w pętli main: {e}")
+            logger.error(f"Krytyczny błąd w pętli asyncio main: {e}")
             logger.error("Restartowanie za 15 sekund...")
             time.sleep(15)
-
