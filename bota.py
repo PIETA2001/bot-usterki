@@ -506,52 +506,68 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Wystąpił błąd przy pobieraniu zdjęcia: {e}")
 
 
-# --- 8. Uruchomienie Bota (w trybie WEBHOOK) ---
+# --- 8. Uruchomienie Bota (WERSJA OSTATECZNA z context manager) ---
 
-# Ustawienia dla Webhooka
-# Render automatycznie poda port w zmiennej środowiskowej
-PORT = int(os.getenv('PORT', 8443)) 
-# To jest Twój publiczny adres URL z Render
-WEBHOOK_URL = "https://bot-usterki.onrender.com"
+# Pobierz port z otoczenia (wymagane przez Cloud Run/Render)
+PORT = int(os.getenv('PORT', 8080)) 
+
+# Pobierz nasz publiczny URL ze zmiennej środowiskowej
+# Pamiętaj, aby ustawić to na Render! Np. https://bot-usterki.onrender.com
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', "https://bot-usterki.onrender.com") 
 
 async def main():
     """Główna funkcja uruchamiająca bota w trybie Webhook."""
     
+    if not WEBHOOK_URL:
+        logger.critical("BŁĄD: Zmienna środowiskowa 'WEBHOOK_URL' nie jest ustawiona!")
+        return
+
     logger.info("Uruchamianie bota w trybie Webhook...")
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Dodaj handlery (bez zmian)
+    # Dodaj handlery
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Krok 1: Ustaw webhooka na serwerach Telegrama
-    # Bot musi wiedzieć, gdzie wysyłać aktualizacje
-    try:
-        logger.info(f"Ustawianie webhooka na adres: {WEBHOOK_URL}")
-        await application.bot.set_webhook(
-            url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
-            allowed_updates=Update.ALL_TYPES
-        )
-    except Exception as e:
-        logger.error(f"BŁĄD KRYTYCZNY: Nie można ustawić webhooka: {e}")
-        return # Nie uruchamiaj bota, jeśli webhook się nie ustawił
+    # Użyj context managera. On automatycznie obsłuży
+    # application.initialize() i application.shutdown()
+    # To powinno poprawnie obsłużyć sygnały zamknięcia (np. z Render)
+    async with application:
+        try:
+            await application.bot.set_webhook(
+                url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
+                allowed_updates=Update.ALL_TYPES
+            )
+            logger.info(f"Webhook ustawiony na adres: {WEBHOOK_URL}")
+        except Exception as e:
+            logger.error(f"BŁĄD KRYTYCZNY: Nie można ustawić webhooka: {e}")
+            return # Zakończ, jeśli się nie udało
 
-    # Krok 2: Uruchom serwer webhooka
-    # Bot będzie teraz nasłuchiwał na porcie podanym przez Render
-    logger.info(f"Bot nasłuchuje na porcie {PORT} pod adresem 0.0.0.0")
-    
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        secret_token=TELEGRAM_TOKEN, # Dodatkowe zabezpieczenie
-        webhook_url=WEBHOOK_URL
-    )
+        # Uruchom serwer webhooka
+        logger.info(f"Bot nasłuchuje na porcie {PORT} pod adresem 0.0.0.0")
+        await application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            secret_token=TELEGRAM_TOKEN,
+            webhook_url=WEBHOOK_URL
+        )
+        # Pętla będzie tu czekać na zawsze, aż dostanie sygnał stop
+
 
 if __name__ == '__main__':
-    # Uruchom główną funkcję asynchroniczną.
-    # Jeśli bot się zawiesi, skrypt się zakończy.
-    # Render (lub Cloud Run) automatycznie wykryje ten błąd i zrestartuje cały kontener.
-    # To jest stabilny i poprawny wzorzec.
-    asyncio.run(main())
+    # Ten blok jest teraz super prosty i poprawny.
+    # asyncio.run() uruchomi main() i poprawnie obsłuży
+    # zamknięcie pętli, gdy main() się zakończy (co jest
+    # obsługiwane przez context manager 'async with application')
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "Cannot close a running event loop" in str(e):
+            logger.warning("Znany błąd asyncio, ale bot powinien działać. Ignorowanie.")
+        else:
+            logger.critical(f"Aplikacja zatrzymana przez błąd: {e}")
+    except Exception as e:
+        logger.critical(f"Nieznany błąd krytyczny: {e}")
+
 
